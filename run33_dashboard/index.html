@@ -702,7 +702,7 @@ function renderSpecies(spList, col) {
 // ── PDF modal ──────────────────────────────────────────────────────────────
 function openSpeciesMap(name) {
   const dotName = name.replace(/ /g, '.');
-  const path = `../../data/pdfs/${dotName}.pdf`;
+  const path = `pdfs/${dotName}.pdf`;
   document.getElementById('pdf-modal-title').textContent = name;
   document.getElementById('pdf-modal-link').href = path;
   document.getElementById('pdf-iframe').src = path + '#navpanes=0';
