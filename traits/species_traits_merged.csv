@@ -20,7 +20,7 @@ salinity_min,salinity_max,sal_midpoint,depth_zone,functional_group,substrate,tra
 0.0,3.0,0.0,littoral,emergent_macrophyte,soft,tier1,Callitriche palustris
 0.0,3.0,1.0,infralittoral,submerged_macrophyte,soft,tier1,Potamogeton berchtoldii
 0.0,3.0,0.0,littoral,submerged_macrophyte,soft,tier1,Ranunculus reptans
-,,,,,,unknown,Caltha palustris
+0.0,2.0,0.0,littoral,emergent_macrophyte,soft,tier1,Caltha palustris
 0.0,3.0,0.0,infralittoral,submerged_macrophyte,soft,tier1,Elatine hydropiper
 0.0,3.0,0.0,infralittoral,macroalga,rock,tier1,Fontinalis hypnoides
 0.0,3.0,0.0,littoral,emergent_macrophyte,soft,tier1,Eleocharis mamillata

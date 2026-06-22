@@ -20,6 +20,7 @@ TIER1_TRAITS = {
     "Schoenoplectus tabernaemontani": {"salinity_min": 0, "salinity_max": 15, "sal_midpoint": 5, "depth_zone": "littoral",    "functional_group": "emergent_macrophyte",   "substrate": "soft"},
     "Typha angustifolia":         {"salinity_min": 0, "salinity_max": 2,  "sal_midpoint": 0,  "depth_zone": "littoral",       "functional_group": "emergent_macrophyte",   "substrate": "soft"},
     "Typha latifolia":            {"salinity_min": 0, "salinity_max": 2,  "sal_midpoint": 0,  "depth_zone": "littoral",       "functional_group": "emergent_macrophyte",   "substrate": "soft"},
+    "Caltha palustris":           {"salinity_min": 0, "salinity_max": 2,  "sal_midpoint": 0,  "depth_zone": "littoral",       "functional_group": "emergent_macrophyte",   "substrate": "soft"},
     "Nymphaea alba":              {"salinity_min": 0, "salinity_max": 2,  "sal_midpoint": 0,  "depth_zone": "infralittoral",  "functional_group": "floating_macrophyte",   "substrate": "soft"},
     "Nuphar lutea":               {"salinity_min": 0, "salinity_max": 2,  "sal_midpoint": 0,  "depth_zone": "infralittoral",  "functional_group": "floating_macrophyte",   "substrate": "soft"},
     "Equisetum fluviatile":       {"salinity_min": 0, "salinity_max": 3,  "sal_midpoint": 0,  "depth_zone": "littoral",       "functional_group": "emergent_macrophyte",   "substrate": "soft"},
