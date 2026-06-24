@@ -30,11 +30,11 @@ DATA      = ROOT / "data"
 SDM_DIR   = DATA / "sdms"
 OUT_REP   = ROOT / "outputs" / "reports"
 TRAITS_F  = ROOT / "traits" / "species_traits_merged.csv"
+OUTLIER_F = DATA / "outlier_species.csv"
 METRICS_F = OUT_REP / "cluster_metrics.csv"
 
 # Set at runtime by main() from the CLI argument
 RUN_DIR   = None
-TIF_DIR   = None
 PNG_DIR   = None
 DENDRO_DIR = None
 COEFF_F   = None
@@ -42,10 +42,9 @@ CLUSTER_ORDER = []
 
 
 def _set_run_paths(run_dir: Path):
-    global RUN_DIR, TIF_DIR, PNG_DIR, DENDRO_DIR, COEFF_F
+    global RUN_DIR, PNG_DIR, DENDRO_DIR, COEFF_F
     RUN_DIR    = run_dir
-    TIF_DIR    = run_dir / "_tifs" / "individ_cluster_binary_tif"
-    PNG_DIR    = run_dir / "_pngs" / "individ_cluster_binary_zone_png"
+    PNG_DIR    = run_dir / "_pngs" / "individ_cluster_binary_png"
     DENDRO_DIR = run_dir / "dendrograms"
     COEFF_F    = run_dir / "species_cluster_coefficients.csv"
 
@@ -134,6 +133,13 @@ DEPTH_COLORS = {
     "> 300 m":   "#011944",
 }
 
+MOBILE_GROUP_COLORS = {
+    "fish":          "#2980b9",
+    "invertebrates": "#e67e22",
+    "birds":         "#27ae60",
+    "mammals":       "#8e44ad",
+}
+
 # If you have mobile species names, fill them in here as a list of 98 strings.
 # Leave as None to use generic "Species N" labels.
 MOBILE_SPECIES_NAMES = None   # e.g. ["Cod", "Herring", ...]
@@ -156,6 +162,18 @@ def load_traits() -> pd.DataFrame:
     if TRAITS_F.exists():
         return pd.read_csv(TRAITS_F)
     return pd.DataFrame()
+
+
+def load_outliers() -> set:
+    """Return a set of (species_name, cluster_name) tuples flagged as outliers."""
+    if not OUTLIER_F.exists():
+        return set()
+    df = pd.read_csv(OUTLIER_F, encoding="utf-8-sig", encoding_errors="replace")
+    df.columns = df.columns.str.strip()
+    # Convert dot-notation to spaces to match how species names are stored internally
+    names    = df["scientific_name"].str.strip().str.replace(".", " ", regex=False)
+    clusters = df["cluster_name"].str.strip()
+    return set(zip(names, clusters))
 
 
 def load_substrate() -> pd.DataFrame:
@@ -224,43 +242,20 @@ def load_sdm_images(species_names: list) -> dict:
     return sdm
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TIF → base64 PNG
-# ─────────────────────────────────────────────────────────────────────────────
 
-def tif_to_b64png(cluster_name: str, hex_color: str, max_dim: int = 900) -> str:
-    tif_path = TIF_DIR / f"{cluster_name}.tif"
-    if not tif_path.exists():
-        return ""
-
-    arr = np.array(Image.open(tif_path), dtype=np.float32)
-    h, w = arr.shape
-
-    # Block-reduce with any(): preserves small clusters, no interpolation blur.
-    # max_dim=900 → block=6 (1.5 km/px) for sharper output than the old block=9.
-    block = max(1, max(h, w) // max_dim)
-    h2, w2 = (h // block) * block, (w // block) * block
-    blocks = arr[:h2, :w2].reshape(h2 // block, block, w2 // block, block)
-
-    presence_pool = (blocks == 1).any(axis=(1, 3))
-    nodata_pool   = np.isnan(blocks).all(axis=(1, 3))
-
-    oh, ow = presence_pool.shape
-    rgba = np.full((oh, ow, 4), [255, 255, 255, 255], dtype=np.uint8)  # absence = white
-    rgba[nodata_pool]   = [155, 160, 165, 255]
-    rgba[presence_pool] = [210,  25,  25, 255]  # presence overwrites nodata
-
-    buf = io.BytesIO()
-    Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG", optimize=True)
-    buf.seek(0)
-    return base64.b64encode(buf.read()).decode()
-
-
-def png_to_b64(cluster_name: str, png_dir: Path = None) -> str:
+def png_to_b64(cluster_name: str, png_dir: Path = None, max_dim: int = 900) -> str:
+    """Load a cluster map PNG, downscale to max_dim, and return a base64 data URI."""
     path = (png_dir or PNG_DIR) / f"{cluster_name}.png"
     if not path.exists():
         return ""
-    return base64.b64encode(path.read_bytes()).decode()
+    img = Image.open(path)
+    w, h = img.size
+    if max(w, h) > max_dim:
+        scale = max_dim / max(w, h)
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return base64.b64encode(buf.getvalue()).decode()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -309,7 +304,7 @@ def substrate_svg(cluster_name: str, substrate_df: pd.DataFrame) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_cluster_data(species_df, traits_df, substrate_df, depth_df,
-                        mobile_df, metrics_df, coeff_df) -> dict:
+                        mobile_df, metrics_df, coeff_df, outlier_set) -> dict:
     data = {}
 
     # Cluster → colour map
@@ -353,6 +348,7 @@ def build_cluster_data(species_df, traits_df, substrate_df, depth_df,
                 "source":  str(t.get("trait_source","?")),
                 "fit":     fit_pct_map.get(sp, None),
                 "fit_val": fit_val_map.get(sp, None),
+                "outlier": (sp, cname) in outlier_set,
             })
 
         # Sort by fit descending so strongest members appear first
@@ -374,13 +370,20 @@ def build_cluster_data(species_df, traits_df, substrate_df, depth_df,
                 val = float(row.get(dname, 0) or 0)
                 depth_list.append({"name": dname, "pct": round(val, 1)})
 
-        # Mobile species top-10 for this cluster
+        # Mobile species top-20 for this cluster
         mob_list = []
         if cname in mobile_df.columns:
             col = mobile_df[cname]
             top_mob = col[col > 0.5].sort_values(ascending=False).head(20)
-            mob_list = [{"name": idx, "pct": round(float(v), 1)}
-                        for idx, v in top_mob.items()]
+            grp_series = mobile_df["species_group"] if "species_group" in mobile_df.columns else None
+            mob_list = [
+                {
+                    "name":  idx,
+                    "pct":   round(float(v), 1),
+                    "group": str(grp_series.loc[idx]) if grp_series is not None and idx in grp_series.index else "",
+                }
+                for idx, v in top_mob.items()
+            ]
 
         # Metrics
         m = {}
@@ -429,7 +432,7 @@ def _dendro_b64(zone: str) -> str:
     return base64.b64encode(path.read_bytes()).decode()
 
 
-def build_html(cluster_data: dict, map_b64_binary: dict, map_b64_sorensen: dict, sdm_images: dict) -> str:
+def build_html(cluster_data: dict, map_b64_binary: dict, map_b64_sorensen: dict, map_b64_specprop: dict, sdm_images: dict) -> str:
     # ── Dendrogram images (compressed, base64) ────────────────────────────────
     dendro_b64 = {z: _dendro_b64(z) for z in ["Zone1", "Zone2", "Zone3", "Zone4"]}
 
@@ -486,7 +489,9 @@ def build_html(cluster_data: dict, map_b64_binary: dict, map_b64_sorensen: dict,
                 js += f'  "{cname}": "data:image/png;base64,{b64}",\n'
         js += "};\n"
         return js
-    maps_js = _maps_js("MAPS_BINARY", map_b64_binary) + _maps_js("MAPS_SORENSEN", map_b64_sorensen)
+    maps_js = (_maps_js("MAPS_BINARY", map_b64_binary)
+             + _maps_js("MAPS_SORENSEN", map_b64_sorensen)
+             + _maps_js("MAPS_SPECPROP", map_b64_specprop))
 
     data_js = f"const CLUSTER_DATA = {json.dumps(cluster_data, ensure_ascii=False)};\n"
 
@@ -494,6 +499,7 @@ def build_html(cluster_data: dict, map_b64_binary: dict, map_b64_sorensen: dict,
     sub_colors_js   = f"const SUB_COLORS = {json.dumps(SUBSTRATE_COLORS)};\n"
     depth_colors_js = f"const DEPTH_COLORS = {json.dumps(DEPTH_COLORS)};\n"
     zone_colors_js  = f"const ZONE_COLORS = {json.dumps(ZONE_COLORS)};\n"
+    mob_group_colors_js = f"const MOB_GROUP_COLORS = {json.dumps(MOBILE_GROUP_COLORS)};\n"
 
     # Dendrogram images
     dendro_js = "const DENDROGRAMS = {\n"
@@ -579,10 +585,6 @@ html, body {{ height:100%; font-family:'Segoe UI',Arial,sans-serif;
   width:18px; height:18px; border-radius:50%; flex-shrink:0;
 }}
 #cluster-title {{ font-size:1.3em; font-weight:700; }}
-#cluster-helcom {{
-  font-size:1.05em; font-weight:700; margin-top:3px;
-  display:none;
-}}
 #cluster-subtitle {{ font-size:.85em; color:#7f8c8d; margin-top:2px; }}
 
 /* ── Content panels ──────────────────────────────────────────────────── */
@@ -719,6 +721,29 @@ html, body {{ height:100%; font-family:'Segoe UI',Arial,sans-serif;
   display:inline-flex; align-items:center; margin:2px 10px 2px 0;
 }}
 
+/* Map image clickable */
+#map-img {{ cursor:zoom-in; }}
+
+/* ── Map lightbox ────────────────────────────────────────────────────── */
+#map-lightbox {{
+  display:none; position:fixed; inset:0;
+  background:rgba(0,0,0,.82); z-index:1000;
+  align-items:center; justify-content:center; cursor:zoom-out;
+}}
+#map-lightbox.open {{ display:flex; }}
+#map-lightbox img {{
+  max-width:94vw; max-height:94vh; display:block;
+  border-radius:4px; box-shadow:0 8px 40px rgba(0,0,0,.6);
+  cursor:default;
+}}
+#map-lightbox-close {{
+  position:absolute; top:14px; right:18px;
+  background:rgba(255,255,255,.15); border:none; color:#fff;
+  font-size:1.4em; cursor:pointer; border-radius:4px;
+  padding:2px 8px; line-height:1.4;
+}}
+#map-lightbox-close:hover {{ background:rgba(255,255,255,.3); }}
+
 /* ── SDM image modal ─────────────────────────────────────────────────── */
 #sdm-modal {{
   display:none; position:fixed; inset:0;
@@ -791,6 +816,8 @@ html, body {{ height:100%; font-family:'Segoe UI',Arial,sans-serif;
 /* Species / mobile rows that have an SDM */
 .sp-card.has-sdm {{ cursor:pointer; }}
 .sp-card.has-sdm:hover {{ border-color:#3498db; background:#f0f8ff; }}
+.sp-card.is-outlier {{ border-color:#e74c3c; background:#fff5f5; }}
+.sp-card.is-outlier:hover {{ border-color:#c0392b; background:#ffe8e8; }}
 .mob-has-sdm {{ cursor:pointer; }}
 .mob-has-sdm:hover td {{ background:#f0f8ff !important; }}
 
@@ -819,7 +846,7 @@ html, body {{ height:100%; font-family:'Segoe UI',Arial,sans-serif;
   <nav id="sidebar">
     <div id="sidebar-header">
       Baltic Habitats
-      <small>22 clusters · Click to explore</small>
+      <small>{len(cluster_data)} clusters · Click to explore</small>
     </div>
     {sidebar_items}
   </nav>
@@ -832,7 +859,6 @@ html, body {{ height:100%; font-family:'Segoe UI',Arial,sans-serif;
       <div id="cluster-dot"></div>
       <div>
         <div id="cluster-title"></div>
-        <div id="cluster-helcom"></div>
         <div id="cluster-subtitle"></div>
       </div>
     </div>
@@ -858,9 +884,12 @@ html, body {{ height:100%; font-family:'Segoe UI',Arial,sans-serif;
                     onclick="switchMapType('sorensen')">Sørensen</button>
             <button class="map-toggle-btn" id="map-btn-binary"
                     onclick="switchMapType('binary')">Binary</button>
+            <button class="map-toggle-btn" id="map-btn-specprop"
+                    onclick="switchMapType('specprop')">Species proportion</button>
           </div>
           <img id="map-img" src="" alt="Cluster distribution map"
-               title="Grey = outside study area  ·  White = absence  ·  Red = presence"/>
+               title="Click to enlarge  ·  Grey = outside study area  ·  White = absence  ·  Red = presence"
+               onclick="openMapLightbox()"/>
           <div class="metrics-panel" id="metrics-panel"></div>
         </div>
         <div class="info-col">
@@ -877,6 +906,14 @@ html, body {{ height:100%; font-family:'Segoe UI',Arial,sans-serif;
           <div class="mobile-panel">
             <div class="panel-title">Mobile species
               <span style="font-weight:400;color:#aaa;font-size:.85em">(top 20 by % overlap)</span>
+            </div>
+            <div style="display:flex;flex-wrap:wrap;gap:6px 12px;margin-bottom:8px;font-size:.75em">
+              {"".join(
+                f'<span style="display:inline-flex;align-items:center;gap:4px">'
+                f'<span style="width:8px;height:8px;border-radius:50%;background:{c};display:inline-block"></span>'
+                f'{g.capitalize()}</span>'
+                for g, c in MOBILE_GROUP_COLORS.items()
+              )}
             </div>
             <div id="mobile-table"></div>
           </div>
@@ -896,6 +933,11 @@ html, body {{ height:100%; font-family:'Segoe UI',Arial,sans-serif;
       <!-- Legend -->
       <div class="legend-bar">
         <b>Functional groups:</b>&nbsp;{fg_legend}
+        <span style="margin-left:18px;border-left:1px solid #dde;padding-left:18px;">
+          <span style="display:inline-block;width:12px;height:12px;border-radius:3px;
+                       background:#fff5f5;border:1.5px solid #e74c3c;
+                       vertical-align:middle;margin-right:5px;"></span>Species flagged as an outlier through expert evaluation
+        </span>
       </div>
 
     </div><!-- /#content -->
@@ -914,6 +956,12 @@ html, body {{ height:100%; font-family:'Segoe UI',Arial,sans-serif;
       <img id="dendro-img" src="" alt="Dendrogram" draggable="false"/>
     </div>
   </div>
+</div>
+
+<!-- Map lightbox -->
+<div id="map-lightbox" onclick="closeMapLightbox()">
+  <button id="map-lightbox-close" onclick="closeMapLightbox()" title="Close">✕</button>
+  <img src="" alt="Cluster distribution map enlarged" onclick="event.stopPropagation()"/>
 </div>
 
 <!-- SDM image modal -->
@@ -936,6 +984,7 @@ html, body {{ height:100%; font-family:'Segoe UI',Arial,sans-serif;
 {sub_colors_js}
 {depth_colors_js}
 {zone_colors_js}
+{mob_group_colors_js}
 {dendro_js}
 {sdm_js}
 
@@ -954,7 +1003,7 @@ function switchMapType(type) {{
   document.querySelectorAll('.map-toggle-btn').forEach(b => b.classList.remove('active'));
   document.getElementById('map-btn-' + type).classList.add('active');
   if (currentCluster) {{
-    const maps = activeMapType === 'binary' ? MAPS_BINARY : MAPS_SORENSEN;
+    const maps = activeMapType === 'binary' ? MAPS_BINARY : activeMapType === 'specprop' ? MAPS_SPECPROP : MAPS_SORENSEN;
     const mapImg = document.getElementById('map-img');
     if (maps[currentCluster]) {{
       mapImg.src = maps[currentCluster];
@@ -985,20 +1034,12 @@ function showCluster(name) {{
   document.getElementById('cluster-dot').style.background = d.colour;
   document.getElementById('cluster-title').textContent = name;
   const m = d.metrics || {{}};
-  const helcomEl = document.getElementById('cluster-helcom');
-  if (m.helcom_match && m.helcom_score > 0.1) {{
-    helcomEl.textContent = m.helcom_match;
-    helcomEl.style.color = d.colour;
-    helcomEl.style.display = 'block';
-  }} else {{
-    helcomEl.style.display = 'none';
-  }}
   document.getElementById('cluster-subtitle').textContent =
     ZONE_LABELS[d.zone] + ' · ' + (m.dom_fg || '').replace(/_/g,' ');
 
   // Map
   const mapImg = document.getElementById('map-img');
-  const activeMaps = activeMapType === 'binary' ? MAPS_BINARY : MAPS_SORENSEN;
+  const activeMaps = activeMapType === 'binary' ? MAPS_BINARY : activeMapType === 'specprop' ? MAPS_SPECPROP : MAPS_SORENSEN;
   if (activeMaps[name]) {{
     mapImg.src = activeMaps[name];
     mapImg.style.display = 'block';
@@ -1080,14 +1121,16 @@ function renderMobile(mobList, col) {{
     <tbody>` +
     mobList.map(s => {{
       const bw = Math.round((s.pct / Math.max(maxPct,1)) * 75);
+      const grpCol = (s.group && MOB_GROUP_COLORS[s.group]) ? MOB_GROUP_COLORS[s.group] : col;
+      const dot = `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${{grpCol}};margin-right:5px;vertical-align:middle;flex-shrink:0"></span>`;
       const hasSdm = !!SPECIES_SDM[s.name];
       const cls = hasSdm ? ' class="mob-has-sdm"' : '';
       const click = hasSdm ? `onclick="openSpeciesMap('${{s.name}}')"` : '';
       return `<tr${{cls}} ${{click}}>
-        <td><i>${{s.name}}</i></td>
-        <td class="mob-pct-cell" style="text-align:right;color:${{col}}">${{s.pct.toFixed(1)}}%</td>
+        <td>${{dot}}<i>${{s.name}}</i></td>
+        <td class="mob-pct-cell" style="text-align:right;color:${{grpCol}}">${{s.pct.toFixed(1)}}%</td>
         <td class="mob-bar-cell">
-          <div class="mob-bar" style="width:${{bw}}px;background:${{col}}"></div>
+          <div class="mob-bar" style="width:${{bw}}px;background:${{grpCol}}"></div>
         </td></tr>`;
     }}).join('') + `</tbody></table>`;
 }}
@@ -1105,9 +1148,12 @@ function renderSpecies(spList, col) {{
       ? `${{sp.sal_min}}–${{sp.sal_max}} PSU` : '';
     const hasSdm = !!SPECIES_SDM[sp.name];
     if (hasSdm) cls += ' has-sdm';
+    if (sp.outlier) cls += ' is-outlier';
     const click = hasSdm ? `onclick="openSpeciesMap('${{sp.name}}')"` : '';
-    const fitTxt = sp.fit_val != null
-      ? `<span class="sp-fit">${{(sp.fit_val * 100).toFixed(0)}}%</span>`
+    const fitPct = sp.fit_val != null ? Math.round(sp.fit_val * 100) : null;
+    const fitColor = fitPct !== null && fitPct < 10 ? '#e74c3c' : '#7f8c8d';
+    const fitTxt = fitPct !== null
+      ? `<span class="sp-fit" style="color:${{fitColor}}">${{fitPct}}%</span>`
       : '';
     return `<div class="${{cls}}" ${{click}}>
       <div class="sp-header">
@@ -1197,6 +1243,17 @@ document.addEventListener('mouseup', () => {{
 // Double-click to reset
 _vp.addEventListener('dblclick', _resetDendroView);
 
+// ── Map lightbox ───────────────────────────────────────────────────────────
+function openMapLightbox() {{
+  const src = document.getElementById('map-img').src;
+  if (!src) return;
+  document.querySelector('#map-lightbox img').src = src;
+  document.getElementById('map-lightbox').classList.add('open');
+}}
+function closeMapLightbox() {{
+  document.getElementById('map-lightbox').classList.remove('open');
+}}
+
 // ── SDM image modal ────────────────────────────────────────────────────────
 function openSpeciesMap(name) {{
   const uri = SPECIES_SDM[name];
@@ -1214,9 +1271,9 @@ document.getElementById('sdm-modal').addEventListener('click', function(e) {{
 }});
 
 // Keyboard: up/down arrows to navigate clusters, Escape to close modal
-const ALL_CLUSTERS = ${ json.dumps(CLUSTER_ORDER) };
+const ALL_CLUSTERS = { json.dumps(CLUSTER_ORDER) };
 document.addEventListener('keydown', e => {{
-  if (e.key === 'Escape') {{ closeSdmModal(); closeDendrogram(); return; }}
+  if (e.key === 'Escape') {{ closeMapLightbox(); closeSdmModal(); closeDendrogram(); return; }}
   if (!currentCluster) return;
   const idx = ALL_CLUSTERS.indexOf(currentCluster);
   if (e.key === 'ArrowDown' && idx < ALL_CLUSTERS.length - 1)
@@ -1225,8 +1282,7 @@ document.addEventListener('keydown', e => {{
     showCluster(ALL_CLUSTERS[idx - 1]);
 }});
 
-// Auto-select first cluster on load
-window.addEventListener('load', () => showCluster('Zone1_A'));
+window.addEventListener('load', () => showCluster(ALL_CLUSTERS[0]));
 </script>
 </body>
 </html>"""
@@ -1267,11 +1323,12 @@ def main():
     mobile_df   = load_mobile()
     metrics_df  = load_metrics()
     coeff_df    = load_coefficients()
+    outlier_set = load_outliers()
 
     # Cluster → colour
     colour_map = species_df.groupby("cluster_name")["colour"].first().to_dict()
 
-    print("Loading binary zone PNG maps …")
+    print("Loading binary PNG maps …")
     map_b64_binary = {}
     for cname in CLUSTER_ORDER:
         b64 = png_to_b64(cname)
@@ -1286,6 +1343,14 @@ def main():
         map_b64_sorensen[cname] = b64
         print(f"  {cname}: {'ok' if b64 else 'MISSING'}")
 
+    print("Loading species proportion PNG maps …")
+    specprop_dir = RUN_DIR / "_pngs" / "individ_cluster_specprop_png"
+    map_b64_specprop = {}
+    for cname in CLUSTER_ORDER:
+        b64 = png_to_b64(cname, specprop_dir)
+        map_b64_specprop[cname] = b64
+        print(f"  {cname}: {'ok' if b64 else 'MISSING'}")
+
     print("\nLoading SDM images …")
     all_species = species_df["species"].unique().tolist()
     sdm_images = load_sdm_images(all_species)
@@ -1293,13 +1358,13 @@ def main():
 
     print("Building cluster data …")
     cluster_data = build_cluster_data(
-        species_df, traits_df, substrate_df, depth_df, mobile_df, metrics_df, coeff_df
+        species_df, traits_df, substrate_df, depth_df, mobile_df, metrics_df, coeff_df, outlier_set
     )
 
     print("Generating HTML …")
-    html = build_html(cluster_data, map_b64_binary, map_b64_sorensen, sdm_images)
+    html = build_html(cluster_data, map_b64_binary, map_b64_sorensen, map_b64_specprop, sdm_images)
 
-    out = OUT_REP / f"{run_name}_cluster_dashboard.html"
+    out = OUT_REP / f"{run_name}.html"
     out.write_text(html, encoding="utf-8")
     size_mb = out.stat().st_size / 1e6
     print(f"\nDone.  Output: {out}  ({size_mb:.1f} MB)")
